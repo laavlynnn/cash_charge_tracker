@@ -1,5 +1,8 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi_web/sqflite_ffi_web.dart';
 import 'package:path/path.dart' as path;
@@ -7,14 +10,9 @@ import 'package:path/path.dart' as path;
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Chrome/Web needs the SQLite Web factory before using sqflite.
-  // Android/iOS will continue using the normal sqflite factory.
   if (kIsWeb) {
     databaseFactory = databaseFactoryFfiWeb;
   }
-
-  // Start database initialization immediately.
-  DatabaseHelper.database;
 
   runApp(const CashChargeTrackerApp());
 }
@@ -110,7 +108,6 @@ class CashChargeTrackerApp extends StatelessWidget {
 
 class DatabaseHelper {
   static Database? _database;
-  static List<Map<String, dynamic>>? _chargeRulesCache;
 
   static final List<Map<String, double>> defaultRules = [
     {'min': 1, 'max': 100, 'charge': 5},
@@ -135,7 +132,6 @@ class DatabaseHelper {
     final String databaseFile;
 
     if (kIsWeb) {
-      // Web SQLite is persisted in the browser's IndexedDB.
       databaseFile = 'cash_charge_tracker_web.db';
     } else {
       final databasePath = await getDatabasesPath();
@@ -196,7 +192,7 @@ class DatabaseHelper {
     ''');
   }
 
-  static Future<void> _insertDefaultRules(Database db) async {
+  static Future<void> _insertDefaultRules(DatabaseExecutor db) async {
     for (final rule in defaultRules) {
       await db.insert('charge_rules', {
         'minAmount': rule['min'],
@@ -227,21 +223,12 @@ class DatabaseHelper {
     );
   }
 
-  static Future<List<Map<String, dynamic>>> getChargeRules({
-    bool forceRefresh = false,
-  }) async {
-    if (!forceRefresh && _chargeRulesCache != null) {
-      return List<Map<String, dynamic>>.from(_chargeRulesCache!);
-    }
-
+  static Future<List<Map<String, dynamic>>> getChargeRules() async {
     final db = await database;
-    final data = await db.query(
+    return db.query(
       'charge_rules',
       orderBy: 'minAmount ASC',
     );
-
-    _chargeRulesCache = List<Map<String, dynamic>>.from(data);
-    return List<Map<String, dynamic>>.from(data);
   }
 
   static Future<int> insertChargeRule({
@@ -250,13 +237,11 @@ class DatabaseHelper {
     required double charge,
   }) async {
     final db = await database;
-    final result = await db.insert('charge_rules', {
+    return db.insert('charge_rules', {
       'minAmount': minAmount,
       'maxAmount': maxAmount,
       'charge': charge,
     });
-    _chargeRulesCache = null;
-    return result;
   }
 
   static Future<int> updateChargeRule({
@@ -266,7 +251,7 @@ class DatabaseHelper {
     required double charge,
   }) async {
     final db = await database;
-    final result = await db.update(
+    return db.update(
       'charge_rules',
       {
         'minAmount': minAmount,
@@ -276,52 +261,214 @@ class DatabaseHelper {
       where: 'id = ?',
       whereArgs: [id],
     );
-    _chargeRulesCache = null;
-    return result;
   }
 
   static Future<int> deleteChargeRule(int id) async {
     final db = await database;
-    final result = await db.delete(
+    return db.delete(
       'charge_rules',
       where: 'id = ?',
       whereArgs: [id],
     );
-    _chargeRulesCache = null;
-    return result;
   }
 
   static Future<void> resetChargeRules() async {
     final db = await database;
-    await db.delete('charge_rules');
-    await _insertDefaultRules(db);
-    _chargeRulesCache = null;
+    await db.transaction((txn) async {
+      await txn.delete('charge_rules');
+      await _insertDefaultRules(txn);
+    });
   }
 
+  /// Calculates the service charge from the SAVED rules in SQLite.
+  /// Amounts above the highest saved rule continue the pattern learned from
+  /// the saved rules (see [ChargeEngine]); nothing is hard-coded.
   static Future<double?> calculateCharge(double amount) async {
-    if (amount <= 0) return 0;
+    if (amount <= 0) return null;
 
-    // Fixed charge rules. These are intentionally not editable.
-    for (final rule in defaultRules) {
-      final min = (rule['min'] as num).toDouble();
-      final max = (rule['max'] as num).toDouble();
-      final charge = (rule['charge'] as num).toDouble();
+    final rules = await getChargeRules();
+    return ChargeEngine.calculate(rules, amount);
+  }
+}
 
-      if (amount >= min && amount <= max) {
-        return charge;
+// ============================================================
+// CHARGE ENGINE (uses saved rules + derived continuation)
+// ============================================================
+
+class _ContinuationPattern {
+  final double base; // highest amount covered by the saved rules
+  final double lastCharge; // charge of the highest saved rule
+  final double widthA; // width of the 1st rule in the repeating pair
+  final double widthB; // width of the 2nd rule in the repeating pair
+  final double stepA; // charge increase going INTO a type-A rule
+  final double stepB; // charge increase going INTO a type-B rule
+
+  const _ContinuationPattern({
+    required this.base,
+    required this.lastCharge,
+    required this.widthA,
+    required this.widthB,
+    required this.stepA,
+    required this.stepB,
+  });
+}
+
+class ChargeEngine {
+  static double _num(dynamic value) => (value as num).toDouble();
+
+  static double _nonNegative(double value) => value < 0 ? 0.0 : value;
+
+  static List<Map<String, dynamic>> sortRules(
+    List<Map<String, dynamic>> rules,
+  ) {
+    final sorted = List<Map<String, dynamic>>.from(rules);
+    sorted.sort(
+      (a, b) => _num(a['minAmount']).compareTo(_num(b['minAmount'])),
+    );
+    return sorted;
+  }
+
+  /// Learns the continuation pattern from the LAST saved rules.
+  ///
+  /// The last two rules give the repeating pair of range widths, and the
+  /// last three rules give the charge increase of each step. With the
+  /// default rules this yields widths 100 / 900 and steps of +5, so
+  /// 5,001-5,100 = 55, 5,101-6,000 = 60, and so on. If the saved rules
+  /// change (for example steps of +10), the continuation changes too.
+  static _ContinuationPattern? _patternFrom(List<Map<String, dynamic>> sorted) {
+    if (sorted.isEmpty) return null;
+
+    final count = sorted.length;
+    final last = sorted[count - 1];
+    final lastMin = _num(last['minAmount']);
+    final lastMax = _num(last['maxAmount']);
+    final lastCharge = _num(last['charge']);
+    final lastWidth = lastMax - lastMin + 1;
+
+    if (count == 1) {
+      // One rule only: repeat its width and add its charge each step.
+      return _ContinuationPattern(
+        base: lastMax,
+        lastCharge: lastCharge,
+        widthA: lastWidth,
+        widthB: lastWidth,
+        stepA: lastCharge,
+        stepB: lastCharge,
+      );
+    }
+
+    final prev = sorted[count - 2];
+    final prevWidth = _num(prev['maxAmount']) - _num(prev['minAmount']) + 1;
+    final prevCharge = _num(prev['charge']);
+
+    final stepB = _nonNegative(lastCharge - prevCharge);
+    final stepA = count >= 3
+        ? _nonNegative(prevCharge - _num(sorted[count - 3]['charge']))
+        : stepB;
+
+    return _ContinuationPattern(
+      base: lastMax,
+      lastCharge: lastCharge,
+      widthA: prevWidth,
+      widthB: lastWidth,
+      stepA: stepA,
+      stepB: stepB,
+    );
+  }
+
+  /// Returns the service charge for [amount], or null if no rule covers it.
+  /// Saved rules always win; the derived continuation is only used for
+  /// amounts above the highest saved rule.
+  static double? calculate(List<Map<String, dynamic>> rules, double amount) {
+    if (amount <= 0 || rules.isEmpty) return null;
+
+    final sorted = sortRules(rules);
+
+    // 1. Saved rules (manual rules take priority over generated ones).
+    // Centavo amounts that fall between two touching ranges (for example
+    // 100.50 between 1-100 and 101-1,000) belong to the higher range.
+    double? previousMax = _num(sorted.first['minAmount']) <= 1 ? 0.0 : null;
+    for (final rule in sorted) {
+      final min = _num(rule['minAmount']);
+      final max = _num(rule['maxAmount']);
+
+      final inRange = amount >= min && amount <= max;
+      final inTouchingGap = previousMax != null &&
+          amount > previousMax &&
+          amount < min &&
+          (min - previousMax) <= 1;
+
+      if (inRange || inTouchingGap) {
+        return _num(rule['charge']);
+      }
+      previousMax = max;
+    }
+
+    // 2. Above the highest saved rule: continue the derived pattern.
+    final pattern = _patternFrom(sorted);
+    if (pattern == null || amount <= pattern.base) {
+      return null; // inside an uncovered gap between saved rules
+    }
+
+    final offset = amount - pattern.base;
+    final period = pattern.widthA + pattern.widthB;
+    final ratio = double.parse((offset / period).toStringAsFixed(9));
+    var fullPeriods = ratio.ceil() - 1;
+    if (fullPeriods < 0) fullPeriods = 0;
+
+    final remainder = offset - (fullPeriods * period);
+
+    var charge = pattern.lastCharge +
+        (fullPeriods * (pattern.stepA + pattern.stepB)) +
+        pattern.stepA;
+    if (remainder > pattern.widthA + 0.000000001) {
+      charge += pattern.stepB;
+    }
+    return charge;
+  }
+
+  /// The next [count] automatically generated ranges after the saved rules.
+  static List<Map<String, double>> preview(
+    List<Map<String, dynamic>> rules, {
+    int count = 4,
+  }) {
+    final pattern = _patternFrom(sortRules(rules));
+    if (pattern == null) return [];
+
+    final result = <Map<String, double>>[];
+    var min = pattern.base + 1;
+    var charge = pattern.lastCharge;
+
+    for (var i = 0; i < count; i++) {
+      final isA = i % 2 == 0;
+      final width = isA ? pattern.widthA : pattern.widthB;
+      charge += isA ? pattern.stepA : pattern.stepB;
+      final max = min + width - 1;
+      result.add({'min': min, 'max': max, 'charge': charge});
+      min = max + 1;
+    }
+    return result;
+  }
+
+  /// Ranges of whole-peso amounts that no saved rule covers.
+  static List<List<double>> findGaps(List<Map<String, dynamic>> rules) {
+    final sorted = sortRules(rules);
+    final gaps = <List<double>>[];
+    if (sorted.isEmpty) return gaps;
+
+    final firstMin = _num(sorted.first['minAmount']);
+    if (firstMin >= 2) {
+      gaps.add([1.0, firstMin - 1]);
+    }
+
+    for (var i = 1; i < sorted.length; i++) {
+      final previousMax = _num(sorted[i - 1]['maxAmount']);
+      final nextMin = _num(sorted[i]['minAmount']);
+      if (nextMin - previousMax >= 2) {
+        gaps.add([previousMax + 1, nextMin - 1]);
       }
     }
-
-    // Continue the same pattern for amounts above ₱5,000.
-    final block = ((amount - 1001) / 1000).floor();
-    final positionInBlock = amount - (1001 + (block * 1000));
-    double charge = 15 + (block * 10);
-
-    if (positionInBlock >= 100) {
-      charge += 5;
-    }
-
-    return charge;
+    return gaps;
   }
 }
 
@@ -363,6 +510,32 @@ String shortDate(String dateString) {
 bool requiresCustomerInformation(String type, double amount) {
   return type == 'Cash In' && amount >= 5000;
 }
+
+/// Validates the FORMAT of a Philippine mobile number: 09XXXXXXXXX
+/// (exactly 11 digits, digits only, starting with 09). This does not check
+/// whether the number is active or belongs to a carrier.
+String? validatePhMobileNumber(String value) {
+  final number = value.trim();
+
+  if (number.isEmpty) {
+    return 'Contact number is required.';
+  }
+  if (!RegExp(r'^[0-9]+$').hasMatch(number)) {
+    return 'Contact number must contain digits only.';
+  }
+  if (number.length != 11) {
+    return 'Contact number must be exactly 11 digits (09XXXXXXXXX).';
+  }
+  if (!number.startsWith('09')) {
+    return 'Contact number must start with 09 (09XXXXXXXXX).';
+  }
+  return null;
+}
+
+/// Allows only digits and one decimal point with at most 2 decimal places.
+List<TextInputFormatter> moneyFormatters() => [
+      FilteringTextInputFormatter.allow(RegExp(r'^[0-9]*\.?[0-9]{0,2}')),
+    ];
 
 // ============================================================
 // COMMON WIDGETS
@@ -744,12 +917,16 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   int selectedIndex = 0;
 
-  final List<Widget> screens = const [
-    HomeScreen(),
-    TransactionsScreen(),
-    ReportsScreen(),
-    SettingsScreen(),
-  ];
+  int refreshVersion = 0;
+
+  // Changing the keys makes the visible tab reload its data after a
+  // transaction is saved, so totals are never stale.
+  List<Widget> get screens => [
+        HomeScreen(key: ValueKey('home-$refreshVersion')),
+        TransactionsScreen(key: ValueKey('history-$refreshVersion')),
+        ReportsScreen(key: ValueKey('reports-$refreshVersion')),
+        const SettingsScreen(),
+      ];
 
   Future<void> openAddTransaction() async {
     await Navigator.push(
@@ -759,7 +936,8 @@ class _MainScreenState extends State<MainScreen> {
       ),
     );
 
-    setState(() {});
+    if (!mounted) return;
+    setState(() => refreshVersion++);
   }
 
   @override
@@ -1118,6 +1296,8 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
   String selectedType = 'Cash In';
   double? charge;
   bool calculating = false;
+  bool submitted = false;
+  int calcToken = 0;
 
   bool get customerInfoRequired {
     final amount = double.tryParse(amountController.text.trim()) ?? 0;
@@ -1132,11 +1312,13 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
 
   Future<void> calculate() async {
     final amount = double.tryParse(amountController.text.trim()) ?? 0;
+    final token = ++calcToken;
 
     setState(() => calculating = true);
     final result = await DatabaseHelper.calculateCharge(amount);
 
-    if (!mounted) return;
+    // Ignore outdated results if the amount changed while calculating.
+    if (!mounted || token != calcToken) return;
     setState(() {
       charge = result;
       calculating = false;
@@ -1152,6 +1334,7 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
     }
 
     final calculatedCharge = await DatabaseHelper.calculateCharge(amount);
+    if (!mounted) return;
 
     if (calculatedCharge == null) {
       _showMessage(
@@ -1160,12 +1343,24 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
       return;
     }
 
-    if (requiresCustomerInformation(selectedType, amount)) {
-      if (customerNameController.text.trim().isEmpty ||
-          customerContactController.text.trim().isEmpty) {
-        _showMessage(
-          'Please enter the customer name and contact number.',
-        );
+    // Customer information applies to Cash In of ₱5,000 and above only.
+    final needsCustomer = requiresCustomerInformation(selectedType, amount);
+    final customerName =
+        needsCustomer ? customerNameController.text.trim() : null;
+    final customerContact =
+        needsCustomer ? customerContactController.text.trim() : null;
+
+    if (needsCustomer) {
+      setState(() => submitted = true);
+
+      if ((customerName ?? '').isEmpty) {
+        _showMessage('Please enter the customer name.');
+        return;
+      }
+
+      final contactError = validatePhMobileNumber(customerContact ?? '');
+      if (contactError != null) {
+        _showMessage(contactError);
         return;
       }
     }
@@ -1175,12 +1370,8 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
       'amount': amount,
       'charge': calculatedCharge,
       'date': DateTime.now().toIso8601String(),
-      'customerName': requiresCustomerInformation(selectedType, amount)
-          ? customerNameController.text.trim()
-          : null,
-      'customerContact': requiresCustomerInformation(selectedType, amount)
-          ? customerContactController.text.trim()
-          : null,
+      'customerName': customerName,
+      'customerContact': customerContact,
     });
 
     if (!mounted) return;
@@ -1269,6 +1460,7 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
           TextField(
             controller: amountController,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            inputFormatters: moneyFormatters(),
             style: const TextStyle(
               color: AppColors.text,
               fontSize: 22,
@@ -1373,18 +1565,35 @@ class _AddTransactionScreenState extends State<AddTransactionScreen> {
                   TextField(
                     controller: customerNameController,
                     textCapitalization: TextCapitalization.words,
-                    decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.person_outline),
+                    onChanged: (_) => setState(() {}),
+                    decoration: InputDecoration(
+                      prefixIcon: const Icon(Icons.person_outline),
                       labelText: 'Customer Name',
+                      errorText: submitted &&
+                              customerNameController.text.trim().isEmpty
+                          ? 'Customer name is required.'
+                          : null,
                     ),
                   ),
                   const SizedBox(height: 10),
                   TextField(
                     controller: customerContactController,
-                    keyboardType: TextInputType.phone,
-                    decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.phone_outlined),
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(11),
+                    ],
+                    onChanged: (_) => setState(() {}),
+                    decoration: InputDecoration(
+                      prefixIcon: const Icon(Icons.phone_outlined),
                       labelText: 'Contact Number',
+                      hintText: '09XXXXXXXXX',
+                      helperText: 'Philippine mobile number: 11 digits, starts with 09',
+                      errorText: submitted
+                          ? validatePhMobileNumber(
+                              customerContactController.text,
+                            )
+                          : null,
                     ),
                   ),
                 ],
@@ -1519,14 +1728,11 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
           ),
         ],
       ),
-      body: RefreshIndicator(
-        color: AppColors.purple,
-        onRefresh: loadTransactions,
-        child: ListView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 120),
-          children: [
-            Container(
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Container(
               padding: const EdgeInsets.all(5),
               decoration: BoxDecoration(
                 color: AppColors.surface,
@@ -1557,9 +1763,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                           item,
                           textAlign: TextAlign.center,
                           style: TextStyle(
-                            color: selected
-                                ? Colors.white
-                                : AppColors.muted,
+                            color: selected ? Colors.white : AppColors.muted,
                             fontSize: 12,
                             fontWeight: FontWeight.w800,
                           ),
@@ -1570,22 +1774,37 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                 }).toList(),
               ),
             ),
-            const SizedBox(height: 16),
-            if (filtered.isEmpty)
-              const EmptyState(
-                icon: Icons.receipt_long_outlined,
-                message: 'No transactions found.',
-              )
-            else
-              ...filtered.map(
-                (transaction) => TransactionCard(
-                  transaction: transaction,
-                  showDelete: true,
-                  onDelete: () => _confirmDelete(transaction),
-                ),
+          ),
+          Expanded(
+            child: RefreshIndicator(
+              color: AppColors.purple,
+              onRefresh: loadTransactions,
+              child: ListView.builder(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 120),
+                itemCount: filtered.isEmpty ? 1 : filtered.length,
+                itemBuilder: (context, index) {
+                  if (filtered.isEmpty) {
+                    return const Padding(
+                      padding: EdgeInsets.only(top: 20),
+                      child: EmptyState(
+                        icon: Icons.receipt_long_outlined,
+                        message: 'No transactions found.',
+                      ),
+                    );
+                  }
+
+                  final transaction = filtered[index];
+                  return TransactionCard(
+                    transaction: transaction,
+                    showDelete: true,
+                    onDelete: () => _confirmDelete(transaction),
+                  );
+                },
               ),
-          ],
-        ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1673,6 +1892,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
     double monthlyCashIn = 0;
     double monthlyCashOut = 0;
     int monthlyCount = 0;
+    int monthlyCashInCount = 0;
+    int monthlyCashOutCount = 0;
 
     for (final transaction in transactions) {
       final date = DateTime.parse(transaction['date'] as String);
@@ -1683,8 +1904,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
         monthlyCount++;
         if (transaction['type'] == 'Cash In') {
           monthlyCashIn += amount;
+          monthlyCashInCount++;
         } else {
           monthlyCashOut += amount;
+          monthlyCashOutCount++;
         }
       }
     }
@@ -1722,7 +1945,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 children: [
                   Text(
                     '$monthName ${now.year}',
-                    style: TextStyle(
+                    style: const TextStyle(
                       color: AppColors.muted,
                       fontWeight: FontWeight.w600,
                     ),
@@ -1802,17 +2025,11 @@ class _ReportsScreenState extends State<ReportsScreen> {
                   ),
                   _ReportRow(
                     label: 'Cash In transactions',
-                    value: '${transactions.where((t) => t['type'] == 'Cash In').where((t) {
-                      final d = DateTime.parse(t['date'] as String);
-                      return d.year == now.year && d.month == now.month;
-                    }).length}',
+                    value: '$monthlyCashInCount',
                   ),
                   _ReportRow(
                     label: 'Cash Out transactions',
-                    value: '${transactions.where((t) => t['type'] == 'Cash Out').where((t) {
-                      final d = DateTime.parse(t['date'] as String);
-                      return d.year == now.year && d.month == now.month;
-                    }).length}',
+                    value: '$monthlyCashOutCount',
                   ),
                 ],
               ),
@@ -1862,11 +2079,18 @@ class _ReportRow extends StatelessWidget {
 }
 
 // ============================================================
-// SETTINGS + FIXED CHARGE RULES
+// SETTINGS + EDITABLE CHARGE RULES
 // ============================================================
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
+
+  Future<void> openPage(BuildContext context, Widget page) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => page),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1880,124 +2104,67 @@ class SettingsScreen extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 120),
         children: [
-          GlowContainer(
-            gradient: const [
-              Color(0xFF111B3A),
-              Color(0xFF1B1039),
-            ],
-            child: const Row(
-              children: [
-                Icon(Icons.receipt_long_rounded, color: AppColors.purple),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Service Charge Rules',
-                        style: TextStyle(
-                          color: AppColors.text,
-                          fontWeight: FontWeight.w800,
-                          fontSize: 16,
-                        ),
-                      ),
-                      SizedBox(height: 4),
-                      Text(
-                        'These are the fixed service charges used for Cash In and Cash Out.',
-                        style: TextStyle(
-                          color: AppColors.muted,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
+          const SectionTitle(
+            title: 'Preferences',
+            subtitle: 'Manage your app settings and information.',
           ),
           const SizedBox(height: 12),
           GlowContainer(
+            padding: EdgeInsets.zero,
             child: Column(
               children: [
-                for (final rule in DatabaseHelper.defaultRules)
-                  _FixedRuleTile(rule: rule),
-                const Divider(height: 24),
-                const Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(
-                      Icons.auto_awesome,
-                      color: AppColors.purple,
-                      size: 18,
-                    ),
-                    SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'For amounts above ₱5,000, the same ₱5-step pattern continues automatically.',
-                        style: TextStyle(
-                          color: AppColors.muted,
-                          fontSize: 11,
-                          height: 1.4,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 28),
-          const SectionTitle(
-            title: 'Customer Information',
-            subtitle: 'Only collected when required for a transaction.',
-          ),
-          const SizedBox(height: 12),
-          GlowContainer(
-            child: const Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(
-                  Icons.person_outline,
-                  color: AppColors.pink,
-                ),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'Customer Name and Contact Number are required only for Cash In transactions of ₱5,000 and above. Cash Out transactions do not require customer information.',
-                    style: TextStyle(
-                      color: AppColors.muted,
-                      height: 1.45,
-                    ),
+                _SettingsTile(
+                  icon: Icons.tune_rounded,
+                  iconColor: AppColors.purple,
+                  title: 'Edit Charge Rules',
+                  subtitle: 'Customize your service charges',
+                  onTap: () => openPage(
+                    context,
+                    const ChargeRulesScreen(),
                   ),
                 ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          GlowContainer(
-            child: const Column(
-              children: [
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.wifi_off, color: AppColors.blue),
-                  title: Text(
-                    'Offline Mode',
-                    style: TextStyle(fontWeight: FontWeight.w800),
-                  ),
-                  subtitle: Text(
-                    'Your transactions are stored on this device.',
+                const Divider(height: 1),
+                _SettingsTile(
+                  icon: Icons.currency_exchange_rounded,
+                  iconColor: AppColors.cyan,
+                  title: 'Exchange Rates (API)',
+                  subtitle: 'Fetch live currency rates from the internet',
+                  onTap: () => openPage(
+                    context,
+                    const ExchangeRatesScreen(),
                   ),
                 ),
-                Divider(),
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.info_outline, color: AppColors.purple),
-                  title: Text(
-                    'About the App',
-                    style: TextStyle(fontWeight: FontWeight.w800),
+                const Divider(height: 1),
+                _SettingsTile(
+                  icon: Icons.person_outline,
+                  iconColor: AppColors.pink,
+                  title: 'Customer Information',
+                  subtitle: 'View customer information requirements',
+                  onTap: () => openPage(
+                    context,
+                    const CustomerInformationScreen(),
                   ),
-                  subtitle: Text(
-                    'Cash Charge Tracker\nDark Cinematic Edition',
+                ),
+                const Divider(height: 1),
+                _SettingsTile(
+                  icon: Icons.wifi_off_rounded,
+                  iconColor: AppColors.blue,
+                  title: 'Offline Mode',
+                  subtitle: 'Transactions are stored on this device',
+                  onTap: () => openPage(
+                    context,
+                    const OfflineModeScreen(),
+                  ),
+                ),
+                const Divider(height: 1),
+                _SettingsTile(
+                  icon: Icons.info_outline,
+                  iconColor: AppColors.purple,
+                  title: 'About the App',
+                  subtitle: 'Cash Charge Tracker • Version 3.0.0',
+                  onTap: () => openPage(
+                    context,
+                    const AboutAppScreen(),
                   ),
                 ),
               ],
@@ -2009,19 +2176,943 @@ class SettingsScreen extends StatelessWidget {
   }
 }
 
-class _FixedRuleTile extends StatelessWidget {
-  final Map<String, num> rule;
+class _SettingsTile extends StatelessWidget {
+  final IconData icon;
+  final Color iconColor;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
 
-  const _FixedRuleTile({required this.rule});
+  const _SettingsTile({
+    required this.icon,
+    required this.iconColor,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final min = rule['min']!.toDouble();
-    final max = rule['max']!.toDouble();
-    final charge = rule['charge']!.toDouble();
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(
+        horizontal: 16,
+        vertical: 7,
+      ),
+      leading: Container(
+        width: 44,
+        height: 44,
+        decoration: BoxDecoration(
+          color: iconColor.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: iconColor.withValues(alpha: 0.20),
+          ),
+        ),
+        child: Icon(icon, color: iconColor, size: 21),
+      ),
+      title: Text(
+        title,
+        style: const TextStyle(
+          color: AppColors.text,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 3),
+        child: Text(
+          subtitle,
+          style: const TextStyle(
+            color: AppColors.muted,
+            fontSize: 12,
+          ),
+        ),
+      ),
+      trailing: const Icon(
+        Icons.chevron_right_rounded,
+        color: AppColors.dim,
+      ),
+      onTap: onTap,
+    );
+  }
+}
+
+// ============================================================
+// CHARGE RULES SCREEN
+// ============================================================
+
+class ChargeRulesScreen extends StatefulWidget {
+  const ChargeRulesScreen({super.key});
+
+  @override
+  State<ChargeRulesScreen> createState() => _ChargeRulesScreenState();
+}
+
+class _ChargeRulesScreenState extends State<ChargeRulesScreen> {
+  List<Map<String, dynamic>> rules = [];
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    loadRules();
+  }
+
+  Future<void> loadRules() async {
+    final data = await DatabaseHelper.getChargeRules();
+    if (!mounted) return;
+    setState(() {
+      rules = data;
+      loading = false;
+    });
+  }
+
+  Future<void> editRule([Map<String, dynamic>? rule]) async {
+    await showDialog(
+      context: context,
+      builder: (_) => ChargeRuleDialog(rule: rule),
+    );
+    await loadRules();
+  }
+
+  Future<void> deleteRule(Map<String, dynamic> rule) async {
+    if (rules.length <= 1) {
+      _showMessage('You must keep at least one charge rule.');
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Delete charge rule?'),
+        content: Text(
+          'Remove ${formatRange(rule)} = ${peso((rule['charge'] as num).toDouble())}?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await DatabaseHelper.deleteChargeRule(rule['id'] as int);
+      await loadRules();
+    }
+  }
+
+  Future<void> resetRules() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Reset charge rules?'),
+        content: const Text(
+          'This will restore the original Cash Charge Tracker rules.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Reset'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await DatabaseHelper.resetChargeRules();
+      await loadRules();
+    }
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Edit Charge Rules',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 40),
+        children: [
+          const GlowContainer(
+            gradient: [
+              Color(0xFF111B3A),
+              Color(0xFF1B1039),
+            ],
+            child: Row(
+              children: [
+                Icon(Icons.tune_rounded, color: AppColors.purple),
+                SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Customize your charges',
+                        style: TextStyle(
+                          color: AppColors.text,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 16,
+                        ),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Edit the amount ranges and service charges anytime.',
+                        style: TextStyle(
+                          color: AppColors.muted,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 22),
+          SectionTitle(
+            title: 'Charge Rules',
+            subtitle: 'These apply to both Cash In and Cash Out.',
+            trailing: IconButton(
+              onPressed: () => editRule(),
+              icon: const Icon(Icons.add_circle_outline),
+              color: AppColors.purple,
+              tooltip: 'Add rule',
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (loading)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.all(30),
+                child: CircularProgressIndicator(),
+              ),
+            )
+          else
+            GlowContainer(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  for (final rule in rules) ...[
+                    _EditableRuleTile(
+                      rule: rule,
+                      onEdit: () => editRule(rule),
+                      onDelete: () => deleteRule(rule),
+                    ),
+                    if (rule != rules.last)
+                      const Divider(height: 1),
+                  ],
+                  const SizedBox(height: 10),
+                  _ContinuationInfo(rules: rules),
+                ],
+              ),
+            ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: resetRules,
+            icon: const Icon(Icons.restore),
+            label: const Text('Reset to Default Rules'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.muted,
+              side: const BorderSide(color: AppColors.border),
+              minimumSize: const Size.fromHeight(48),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(15),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// CUSTOMER INFORMATION SCREEN
+// ============================================================
+
+class CustomerInformationScreen extends StatelessWidget {
+  const CustomerInformationScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Customer Information',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 40),
+        children: [
+          const GlowContainer(
+            gradient: [
+              Color(0xFF171326),
+              Color(0xFF111A35),
+            ],
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.person_outline,
+                      color: AppColors.pink,
+                    ),
+                    SizedBox(width: 10),
+                    Text(
+                      'Current Requirement',
+                      style: TextStyle(
+                        color: AppColors.text,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ],
+                ),
+                SizedBox(height: 14),
+                Text(
+                  'Customer information is required only for Cash In transactions of ₱5,000 and above.',
+                  style: TextStyle(
+                    color: AppColors.muted,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          GlowContainer(
+            child: Column(
+              children: [
+                _RequirementRow(
+                  icon: Icons.person_outline,
+                  title: 'Customer Name',
+                  subtitle: 'Required for Cash In ₱5,000 and above',
+                ),
+                const Divider(),
+                _RequirementRow(
+                  icon: Icons.phone_outlined,
+                  title: 'Contact Number',
+                  subtitle: 'Required and must use 09XXXXXXXXX format',
+                ),
+                const Divider(),
+                const _RequirementRow(
+                  icon: Icons.arrow_downward_rounded,
+                  title: 'Cash Out',
+                  subtitle: 'Customer information is not required',
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RequirementRow extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+
+  const _RequirementRow({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: CircleAvatar(
+        backgroundColor: AppColors.purple.withValues(alpha: 0.12),
+        child: Icon(icon, color: AppColors.purple),
+      ),
+      title: Text(
+        title,
+        style: const TextStyle(
+          color: AppColors.text,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 3),
+        child: Text(
+          subtitle,
+          style: const TextStyle(
+            color: AppColors.muted,
+            fontSize: 12,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// API INTEGRATION: EXCHANGE RATES
+// ============================================================
+
+class ExchangeRatesScreen extends StatefulWidget {
+  const ExchangeRatesScreen({super.key});
+
+  @override
+  State<ExchangeRatesScreen> createState() => _ExchangeRatesScreenState();
+}
+
+class _ExchangeRatesScreenState extends State<ExchangeRatesScreen> {
+  bool loading = false;
+  String? errorMessage;
+  String? lastUpdated;
+  Map<String, dynamic> rates = {};
+
+  // Open Exchange Rate API: PHP is the base currency.
+  static final Uri _apiUri = Uri.parse(
+    'https://open.er-api.com/v6/latest/PHP',
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    fetchRates();
+  }
+
+  Future<void> fetchRates() async {
+    setState(() {
+      loading = true;
+      errorMessage = null;
+    });
+
+    try {
+      final response = await http.get(_apiUri).timeout(
+        const Duration(seconds: 15),
+      );
+
+      if (response.statusCode != 200) {
+        throw Exception('The server returned status ${response.statusCode}.');
+      }
+
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic> ||
+          decoded['result'] != 'success' ||
+          decoded['rates'] is! Map<String, dynamic>) {
+        throw Exception('The API returned an unexpected response.');
+      }
+
+      final rawRates = decoded['rates'] as Map<String, dynamic>;
+      const currencies = ['USD', 'EUR', 'GBP', 'JPY', 'SGD', 'AUD', 'CAD', 'KRW'];
+      final selectedRates = <String, dynamic>{};
+
+      for (final currency in currencies) {
+        if (rawRates[currency] is num) {
+          selectedRates[currency] = rawRates[currency];
+        }
+      }
+
+      if (selectedRates.isEmpty) {
+        throw Exception('No currency rates were available.');
+      }
+
+      if (!mounted) return;
+      setState(() {
+        rates = selectedRates;
+        lastUpdated = decoded['time_last_update_utc']?.toString();
+        loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        errorMessage =
+            'Unable to load exchange rates. Check your internet connection and try again.';
+        loading = false;
+      });
+    }
+  }
+
+  String _formatRate(dynamic value) {
+    if (value is num) return value.toStringAsFixed(4);
+    return value.toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currencies = rates.keys.toList();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Exchange Rates',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh rates',
+            onPressed: loading ? null : fetchRates,
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        color: AppColors.purple,
+        onRefresh: fetchRates,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 40),
+          children: [
+            GlowContainer(
+              gradient: const [
+                Color(0xFF111B3A),
+                Color(0xFF1B1039),
+              ],
+              child: const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.currency_exchange_rounded,
+                    color: AppColors.cyan,
+                    size: 30,
+                  ),
+                  SizedBox(height: 12),
+                  Text(
+                    'Live Currency Rates',
+                    style: TextStyle(
+                      color: AppColors.text,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  SizedBox(height: 6),
+                  Text(
+                    'Rates are fetched from a public API. Values show how much of each currency is equivalent to ₱1 PHP.',
+                    style: TextStyle(
+                      color: AppColors.muted,
+                      height: 1.45,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            if (loading)
+              const GlowContainer(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 22),
+                  child: Column(
+                    children: [
+                      CircularProgressIndicator(),
+                      SizedBox(height: 12),
+                      Text(
+                        'Fetching the latest rates...',
+                        style: TextStyle(color: AppColors.muted),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            else if (errorMessage != null)
+              GlowContainer(
+                child: Column(
+                  children: [
+                    const Icon(
+                      Icons.cloud_off_rounded,
+                      color: AppColors.red,
+                      size: 38,
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      errorMessage!,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: AppColors.muted),
+                    ),
+                    const SizedBox(height: 14),
+                    FilledButton.icon(
+                      onPressed: fetchRates,
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text('Try Again'),
+                    ),
+                    if (rates.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      const Text(
+                        'Previously loaded rates are still shown below.',
+                        style: TextStyle(color: AppColors.dim, fontSize: 12),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            if (rates.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SectionTitle(
+                title: 'Available Currencies',
+                subtitle: 'Base currency: Philippine Peso (PHP)',
+                trailing: const Icon(
+                  Icons.public_rounded,
+                  color: AppColors.cyan,
+                ),
+              ),
+              const SizedBox(height: 10),
+              ...List.generate(currencies.length, (index) {
+                final currency = currencies[index];
+                final symbols = {
+                  'USD': '\$',
+                  'EUR': '€',
+                  'GBP': '£',
+                  'JPY': '¥',
+                  'SGD': 'S\$',
+                  'AUD': 'A\$',
+                  'CAD': 'C\$',
+                  'KRW': '₩',
+                };
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: GlowContainer(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 14,
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 44,
+                          height: 44,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: AppColors.cyan.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(13),
+                          ),
+                          child: Text(
+                            currency.substring(0, 2),
+                            style: const TextStyle(
+                              color: AppColors.cyan,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                currency,
+                                style: const TextStyle(
+                                  color: AppColors.text,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              Text(
+                                '1 PHP = ${symbols[currency] ?? ''}${_formatRate(rates[currency])}',
+                                style: const TextStyle(
+                                  color: AppColors.muted,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const Icon(
+                          Icons.trending_up_rounded,
+                          color: AppColors.cyan,
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+              if (lastUpdated != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'API last updated: $lastUpdated',
+                  style: const TextStyle(
+                    color: AppColors.dim,
+                    fontSize: 11,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ],
+            if (!loading && errorMessage == null && rates.isEmpty)
+              const EmptyState(
+                icon: Icons.currency_exchange_rounded,
+                message: 'No exchange-rate data is available yet. Pull down to refresh.',
+              ),
+            const SizedBox(height: 10),
+            const Text(
+              'Exchange rates are informational and may change. They do not affect your saved transactions or service-charge rules.',
+              style: TextStyle(
+                color: AppColors.dim,
+                fontSize: 11,
+                height: 1.4,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// OFFLINE MODE SCREEN
+// ============================================================
+
+class OfflineModeScreen extends StatelessWidget {
+  const OfflineModeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Offline Mode',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 40),
+        children: [
+          const GlowContainer(
+            gradient: [
+              Color(0xFF101B3A),
+              Color(0xFF111A35),
+            ],
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.wifi_off_rounded,
+                  color: AppColors.blue,
+                  size: 28,
+                ),
+                SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Offline Mode is Active',
+                        style: TextStyle(
+                          color: AppColors.text,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 17,
+                        ),
+                      ),
+                      SizedBox(height: 6),
+                      Text(
+                        'Cash Charge Tracker works without an internet connection. Your transactions and charge rules are stored locally on this device.',
+                        style: TextStyle(
+                          color: AppColors.muted,
+                          height: 1.5,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// ABOUT THE APP SCREEN
+// ============================================================
+
+class AboutAppScreen extends StatelessWidget {
+  const AboutAppScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'About the App',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 40),
+        children: [
+          GlowContainer(
+            glow: true,
+            gradient: const [
+              Color(0xFF111B3A),
+              Color(0xFF1B1039),
+            ],
+            child: const Column(
+              children: [
+                Icon(
+                  Icons.account_balance_wallet_rounded,
+                  color: AppColors.purple,
+                  size: 54,
+                ),
+                SizedBox(height: 14),
+                Text(
+                  'Cash Charge Tracker',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: AppColors.text,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'Developer: Lovelyn D. Pojas\nVersion: 3.0.0',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: AppColors.muted,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String formatRange(Map<String, dynamic> rule) {
+  final min = (rule['minAmount'] as num).toDouble();
+  final max = (rule['maxAmount'] as num).toDouble();
+  return '₱${formatAmount(min)} - ₱${formatAmount(max)}';
+}
+
+String formatAmount(double value) {
+  if (value == value.roundToDouble()) {
+    return value.toInt().toString();
+  }
+  return value.toStringAsFixed(2);
+}
+
+/// Shows how amounts ABOVE the highest saved rule are charged, using the
+/// pattern derived from the saved rules, and warns about uncovered gaps.
+class _ContinuationInfo extends StatelessWidget {
+  final List<Map<String, dynamic>> rules;
+
+  const _ContinuationInfo({required this.rules});
+
+  @override
+  Widget build(BuildContext context) {
+    if (rules.isEmpty) return const SizedBox.shrink();
+
+    final sorted = ChargeEngine.sortRules(rules);
+    final base = (sorted.last['maxAmount'] as num).toDouble();
+    final preview = ChargeEngine.preview(rules, count: 4);
+    final gaps = ChargeEngine.findGaps(rules);
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.purple.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: AppColors.purple.withValues(alpha: 0.18),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(
+                Icons.auto_awesome,
+                size: 18,
+                color: AppColors.purple,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Above ₱${formatAmount(base)}, the pattern of your last saved rules continues automatically. A rule you add yourself always takes priority.',
+                  style: const TextStyle(
+                    color: AppColors.muted,
+                    fontSize: 11,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (preview.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            for (final item in preview)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Text(
+                  '₱${formatAmount(item['min']!)} - ₱${formatAmount(item['max']!)}  →  ${peso(item['charge']!)}',
+                  style: const TextStyle(
+                    color: AppColors.text,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+          ],
+          if (gaps.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            for (final gap in gaps)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Text(
+                  'No rule covers ₱${formatAmount(gap[0])} - ₱${formatAmount(gap[1])}.',
+                  style: const TextStyle(
+                    color: AppColors.red,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+class _EditableRuleTile extends StatelessWidget {
+  final Map<String, dynamic> rule;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+
+  const _EditableRuleTile({
+    required this.rule,
+    required this.onEdit,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final charge = (rule['charge'] as num).toDouble();
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 7),
+      padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: [
           Container(
@@ -2034,20 +3125,38 @@ class _FixedRuleTile extends StatelessWidget {
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: Text(
-              '₱${formatAmount(min)} - ₱${formatAmount(max)}',
-              style: const TextStyle(
-                color: AppColors.text,
-                fontWeight: FontWeight.w700,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  formatRange(rule),
+                  style: const TextStyle(
+                    color: AppColors.text,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  'Service charge: ${peso(charge)}',
+                  style: const TextStyle(
+                    color: AppColors.muted,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
             ),
           ),
-          Text(
-            '₱${formatAmount(charge)}',
-            style: const TextStyle(
-              color: AppColors.purple,
-              fontWeight: FontWeight.w800,
-            ),
+          IconButton(
+            onPressed: onEdit,
+            icon: const Icon(Icons.edit_outlined),
+            color: AppColors.blue,
+            tooltip: 'Edit',
+          ),
+          IconButton(
+            onPressed: onDelete,
+            icon: const Icon(Icons.delete_outline),
+            color: AppColors.red,
+            tooltip: 'Delete',
           ),
         ],
       ),
@@ -2055,11 +3164,195 @@ class _FixedRuleTile extends StatelessWidget {
   }
 }
 
-String formatAmount(double value) {
-  if (value == value.roundToDouble()) {
-    return value.toInt().toString();
+class ChargeRuleDialog extends StatefulWidget {
+  final Map<String, dynamic>? rule;
+
+  const ChargeRuleDialog({
+    super.key,
+    this.rule,
+  });
+
+  @override
+  State<ChargeRuleDialog> createState() => _ChargeRuleDialogState();
+}
+
+class _ChargeRuleDialogState extends State<ChargeRuleDialog> {
+  late final TextEditingController minController;
+  late final TextEditingController maxController;
+  late final TextEditingController chargeController;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    final rule = widget.rule;
+    minController = TextEditingController(
+      text: rule == null
+          ? ''
+          : formatAmount((rule['minAmount'] as num).toDouble()),
+    );
+    maxController = TextEditingController(
+      text: rule == null
+          ? ''
+          : formatAmount((rule['maxAmount'] as num).toDouble()),
+    );
+    chargeController = TextEditingController(
+      text: rule == null
+          ? ''
+          : formatAmount((rule['charge'] as num).toDouble()),
+    );
   }
-  return value.toStringAsFixed(2);
+
+  @override
+  void dispose() {
+    minController.dispose();
+    maxController.dispose();
+    chargeController.dispose();
+    super.dispose();
+  }
+
+  Future<void> save() async {
+    final min = double.tryParse(minController.text.trim());
+    final max = double.tryParse(maxController.text.trim());
+    final charge = double.tryParse(chargeController.text.trim());
+
+    if (min == null || max == null || charge == null) {
+      setState(() => error = 'Please enter valid numbers in all fields.');
+      return;
+    }
+
+    if (min <= 0 || max <= 0) {
+      setState(() => error = 'Minimum and maximum amounts must be greater than ₱0.');
+      return;
+    }
+
+    if (charge <= 0) {
+      setState(() => error = 'Service charge must be greater than ₱0.');
+      return;
+    }
+
+    if (min > max) {
+      setState(() => error = 'Minimum amount cannot be greater than maximum amount.');
+      return;
+    }
+
+    final rules = await DatabaseHelper.getChargeRules();
+    if (!mounted) return;
+    final editingId = widget.rule?['id'] as int?;
+
+    for (final existing in rules) {
+      final existingId = existing['id'] as int;
+      if (editingId != null && existingId == editingId) continue;
+
+      final existingMin = (existing['minAmount'] as num).toDouble();
+      final existingMax = (existing['maxAmount'] as num).toDouble();
+
+      if (min == existingMin && max == existingMax) {
+        setState(() {
+          error = 'A rule for ${formatRange(existing)} already exists.';
+        });
+        return;
+      }
+
+      final overlaps = min <= existingMax && max >= existingMin;
+
+      if (overlaps) {
+        setState(() {
+          error =
+              'This range overlaps ${formatRange(existing)}. Use a different range.';
+        });
+        return;
+      }
+    }
+
+    if (editingId == null) {
+      await DatabaseHelper.insertChargeRule(
+        minAmount: min,
+        maxAmount: max,
+        charge: charge,
+      );
+    } else {
+      await DatabaseHelper.updateChargeRule(
+        id: editingId,
+        minAmount: min,
+        maxAmount: max,
+        charge: charge,
+      );
+    }
+
+    if (!mounted) return;
+    Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final editing = widget.rule != null;
+
+    return AlertDialog(
+      backgroundColor: AppColors.surface,
+      title: Text(editing ? 'Edit Charge Rule' : 'Add Charge Rule'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: minController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              inputFormatters: moneyFormatters(),
+              decoration: const InputDecoration(
+                labelText: 'Minimum Amount',
+                prefixText: '₱  ',
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: maxController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              inputFormatters: moneyFormatters(),
+              decoration: const InputDecoration(
+                labelText: 'Maximum Amount',
+                prefixText: '₱  ',
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: chargeController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              inputFormatters: moneyFormatters(),
+              decoration: const InputDecoration(
+                labelText: 'Service Charge',
+                prefixText: '₱  ',
+              ),
+            ),
+            if (error != null) ...[
+              const SizedBox(height: 12),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  error!,
+                  style: const TextStyle(
+                    color: AppColors.red,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.icon(
+          onPressed: save,
+          icon: const Icon(Icons.save_outlined, size: 18),
+          label: const Text('Save'),
+        ),
+      ],
+    );
+  }
 }
 
 // ============================================================
